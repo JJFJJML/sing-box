@@ -25,14 +25,14 @@ type Manager struct {
 	registry                adapter.OutboundRegistry
 	endpoint                adapter.EndpointManager
 	defaultTag              string
-	access                  sync.Mutex
+	access                  sync.RWMutex
 	started                 bool
 	stage                   adapter.StartStage
 	outbounds               []adapter.Outbound
 	outboundByTag           map[string]adapter.Outbound
 	dependByTag             map[string][]string
 	defaultOutbound         adapter.Outbound
-	defaultOutboundFallback adapter.Outbound
+	defaultOutboundFallback func() (adapter.Outbound, error)
 
 	confByTag map[string]*confItem
 }
@@ -55,7 +55,7 @@ func NewManager(logger logger.ContextLogger, registry adapter.OutboundRegistry, 
 	}
 }
 
-func (m *Manager) Initialize(defaultOutboundFallback adapter.Outbound) {
+func (m *Manager) Initialize(defaultOutboundFallback func() (adapter.Outbound, error)) {
 	m.defaultOutboundFallback = defaultOutboundFallback
 }
 
@@ -66,18 +66,31 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 	}
 	m.started = true
 	m.stage = stage
-	outbounds := m.outbounds
-	m.access.Unlock()
 	if stage == adapter.StartStateStart {
 		if m.defaultTag != "" && m.defaultOutbound == nil {
 			defaultEndpoint, loaded := m.endpoint.Get(m.defaultTag)
 			if !loaded {
+				m.access.Unlock()
 				return E.New("default outbound not found: ", m.defaultTag)
 			}
 			m.defaultOutbound = defaultEndpoint
 		}
+		if m.defaultOutbound == nil {
+			directOutbound, err := m.defaultOutboundFallback()
+			if err != nil {
+				m.access.Unlock()
+				return E.Cause(err, "create direct outbound for fallback")
+			}
+			m.outbounds = append(m.outbounds, directOutbound)
+			m.outboundByTag[directOutbound.Tag()] = directOutbound
+			m.defaultOutbound = directOutbound
+		}
+		outbounds := m.outbounds
+		m.access.Unlock()
 		return m.startOutbounds(append(outbounds, common.Map(m.endpoint.Endpoints(), func(it adapter.Endpoint) adapter.Outbound { return it })...))
 	} else {
+		outbounds := m.outbounds
+		m.access.Unlock()
 		for _, outbound := range outbounds {
 			err := adapter.LegacyStart(outbound, stage)
 			if err != nil {
@@ -181,15 +194,15 @@ func (m *Manager) Close() error {
 }
 
 func (m *Manager) Outbounds() []adapter.Outbound {
-	m.access.Lock()
-	defer m.access.Unlock()
+	m.access.RLock()
+	defer m.access.RUnlock()
 	return m.outbounds
 }
 
 func (m *Manager) Outbound(tag string) (adapter.Outbound, bool) {
-	m.access.Lock()
+	m.access.RLock()
 	outbound, found := m.outboundByTag[tag]
-	m.access.Unlock()
+	m.access.RUnlock()
 	if found {
 		return outbound, true
 	}
@@ -197,20 +210,16 @@ func (m *Manager) Outbound(tag string) (adapter.Outbound, bool) {
 }
 
 func (m *Manager) Default() adapter.Outbound {
-	m.access.Lock()
-	defer m.access.Unlock()
-	if m.defaultOutbound != nil {
-		return m.defaultOutbound
-	} else {
-		return m.defaultOutboundFallback
-	}
+	m.access.RLock()
+	defer m.access.RUnlock()
+	return m.defaultOutbound
 }
 
 func (m *Manager) Remove(tag string) error {
 	m.access.Lock()
+	defer m.access.Unlock()
 	outbound, found := m.outboundByTag[tag]
 	if !found {
-		m.access.Unlock()
 		return os.ErrInvalid
 	}
 	delete(m.outboundByTag, tag)
@@ -244,7 +253,6 @@ func (m *Manager) Remove(tag string) error {
 			})
 		}
 	}
-	m.access.Unlock()
 	if started {
 		return common.Close(outbound)
 	}
@@ -259,8 +267,6 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	if err != nil {
 		return err
 	}
-	m.access.Lock()
-	defer m.access.Unlock()
 	if m.started {
 		for _, stage := range adapter.ListStartStages {
 			err = adapter.LegacyStart(outbound, stage)
@@ -269,6 +275,8 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 			}
 		}
 	}
+	m.access.Lock()
+	defer m.access.Unlock()
 	if existsOutbound, loaded := m.outboundByTag[tag]; loaded {
 		if m.started {
 			err = common.Close(existsOutbound)
@@ -306,7 +314,7 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 // DupOverrideDetour duplicates the outbound with the specified tag and sets the override and detour for the duplicated outbound.
 // The original outbound is not affected.
 // The duplicated outbound is not managed by the manager, you should close it manually.
-func (m *Manager) DupOverrideDetour(ctx context.Context, router adapter.Router, tag string, detour N.Dialer) (adapter.Outbound, error) {
+func (m *Manager) DupOverrideDetour(ctx context.Context, router adapter.Router, tag string, logger log.ContextLogger, detour N.Dialer) (adapter.Outbound, error) {
 	m.access.Lock()
 	defer m.access.Unlock()
 	conf, found := m.confByTag[tag]
@@ -315,7 +323,7 @@ func (m *Manager) DupOverrideDetour(ctx context.Context, router adapter.Router, 
 	}
 	// It's hacky here, works only if all outbound creations invoke dialer.New()
 	ctx, used := dialer.ContextWithDetourOverride(ctx, detour)
-	outbound, err := m.registry.CreateOutbound(ctx, router, m.logger, tag, conf.typ, conf.options)
+	outbound, err := m.registry.CreateOutbound(ctx, router, logger, tag, conf.typ, conf.options)
 	if err != nil {
 		return nil, err
 	}

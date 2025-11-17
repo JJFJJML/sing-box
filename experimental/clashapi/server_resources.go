@@ -3,6 +3,7 @@ package clashapi
 import (
 	"archive/zip"
 	"context"
+	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
+	"github.com/sagernet/sing/common/ntp"
 	"github.com/sagernet/sing/service/filemanager"
 )
 
@@ -60,6 +62,10 @@ func (s *Server) downloadExternalUI() error {
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return detour.DialContext(ctx, network, M.ParseSocksaddr(addr))
 			},
+			TLSClientConfig: &tls.Config{
+				Time:    ntp.TimeFuncFromContext(s.ctx),
+				RootCAs: adapter.RootPoolFromContext(s.ctx),
+			},
 		},
 	}
 	defer httpClient.CloseIdleConnections()
@@ -71,15 +77,15 @@ func (s *Server) downloadExternalUI() error {
 	if response.StatusCode != http.StatusOK {
 		return E.New("download external ui failed: ", response.Status)
 	}
-	err = s.downloadZIP(filepath.Base(downloadURL), response.Body, s.externalUI)
+	err = s.downloadZIP(response.Body, s.externalUI)
 	if err != nil {
 		removeAllInDirectory(s.externalUI)
 	}
 	return err
 }
 
-func (s *Server) downloadZIP(name string, body io.Reader, output string) error {
-	tempFile, err := filemanager.CreateTemp(s.ctx, name)
+func (s *Server) downloadZIP(body io.Reader, output string) error {
+	tempFile, err := filemanager.CreateTemp(s.ctx, "external-ui.zip")
 	if err != nil {
 		return err
 	}
