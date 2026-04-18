@@ -28,14 +28,18 @@ const (
 	TypeDERP         = "derp"
 	TypeResolved     = "resolved"
 	TypeSSMAPI       = "ssm-api"
+	TypeCCM          = "ccm"
+	TypeOCM          = "ocm"
+	TypeOOMKiller    = "oom-killer"
 )
 
 const (
 	TypeSelector = "selector"
 	TypeURLTest  = "urltest"
 
-	TypeLoadBalance = "loadbalance"
-	TypeChain       = "chain"
+	TypeLoadBalance        = "loadbalance"
+	TypeLoadBalanceProfile = "loadbalance-profile"
+	TypeChain              = "chain"
 )
 
 func ProxyDisplayName(proxyType string) string {
@@ -86,12 +90,16 @@ func ProxyDisplayName(proxyType string) string {
 		return "Hysteria2"
 	case TypeAnyTLS:
 		return "AnyTLS"
+	case TypeTailscale:
+		return "Tailscale"
 	case TypeSelector:
 		return "Selector"
 	case TypeURLTest:
 		return "URLTest"
 	case TypeLoadBalance:
 		return "LoadBalance"
+	case TypeLoadBalanceProfile:
+		return "LoadBalanceProfile"
 	case TypeChain:
 		return "Chain"
 	default:

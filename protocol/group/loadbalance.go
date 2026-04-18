@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"net"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -11,6 +12,9 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/group/balancer"
+	"github.com/sagernet/sing-box/protocol/group/healthcheck"
+	tun "github.com/sagernet/sing-tun"
+	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -18,12 +22,13 @@ import (
 )
 
 func RegisterLoadBalance(registry *outbound.Registry) {
-	outbound.Register[option.LoadBalanceOutboundOptions](registry, C.TypeLoadBalance, NewLoadBalance)
+	outbound.Register(registry, C.TypeLoadBalance, NewLoadBalance, DeriveLoadBalanceProfiles)
 }
 
 var (
 	_ adapter.Outbound                = (*LoadBalance)(nil)
 	_ adapter.OutboundCheckGroup      = (*LoadBalance)(nil)
+	_ adapter.DirectRouteOutbound     = (*LoadBalance)(nil)
 	_ adapter.SimpleLifecycle         = (*LoadBalance)(nil)
 	_ adapter.InterfaceUpdateListener = (*LoadBalance)(nil)
 )
@@ -45,15 +50,42 @@ type LoadBalance struct {
 // NewLoadBalance creates a new load balance outbound
 func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.LoadBalanceOutboundOptions) (adapter.Outbound, error) {
 	return &LoadBalance{
-		GroupAdapter: outbound.NewGroupAdapter(C.TypeLoadBalance, tag, []string{N.NetworkTCP, N.NetworkUDP}, router, options.ProviderGroupCommonOption),
-		ctx:          ctx,
-		router:       router,
-		logger:       logger,
-		outbound:     service.FromContext[adapter.OutboundManager](ctx),
-		provider:     service.FromContext[adapter.ProviderManager](ctx),
-		connection:   service.FromContext[adapter.ConnectionManager](ctx),
-		options:      options,
+		GroupAdapter: outbound.NewGroupAdapter(
+			C.TypeLoadBalance, tag, []string{N.NetworkTCP, N.NetworkUDP},
+			options.ProviderGroupCommonOption,
+			options.Check.DetourOf...,
+		),
+		ctx:        ctx,
+		router:     router,
+		logger:     logger,
+		outbound:   service.FromContext[adapter.OutboundManager](ctx),
+		provider:   service.FromContext[adapter.ProviderManager](ctx),
+		connection: service.FromContext[adapter.ConnectionManager](ctx),
+		options:    options,
 	}, nil
+}
+
+// DeriveLoadBalanceProfiles derives load balance profile outbounds from load balance outbound options
+func DeriveLoadBalanceProfiles(tag string, options option.LoadBalanceOutboundOptions) []option.Outbound {
+	profiles := options.Profiles
+	if len(profiles) == 0 {
+		return nil
+	}
+	result := make([]option.Outbound, 0, len(profiles))
+	for _, profile := range profiles {
+		result = append(result, option.Outbound{
+			Type: C.TypeLoadBalanceProfile,
+			Tag:  profile.Tag,
+			// Must be pointer type
+			Options: &option.LoadBalanceProfileOutboundOptions{
+				LoadBalanceTag: tag,
+				Exclude:        profile.Exclude,
+				Include:        profile.Include,
+				Pick:           profile.LoadBalancePickOptions,
+			},
+		})
+	}
+	return result
 }
 
 // Now implements adapter.OutboundGroup
@@ -67,8 +99,13 @@ func (s *LoadBalance) Now() string {
 
 // All implements adapter.OutboundGroup
 func (s *LoadBalance) All() []string {
-	s.LogNodes()
-	return s.GroupAdapter.All()
+	// s.LogNodes()
+	// return s.GroupAdapter.All()
+
+	_, filtered := s.GetNodes(true)
+	return common.Map(filtered, func(node *balancer.Node) string {
+		return node.Tag()
+	})
 }
 
 // Network implements adapter.OutboundGroup
@@ -148,6 +185,24 @@ func (s *LoadBalance) NewPacketConnectionEx(ctx context.Context, conn N.PacketCo
 	}
 }
 
+// NewDirectRouteConnection implements adapter.DirectRouteOutbound
+func (s *LoadBalance) NewDirectRouteConnection(metadata adapter.InboundContext, routeContext tun.DirectRouteContext, timeout time.Duration) (tun.DirectRouteDestination, error) {
+	ctx := adapter.WithContext(context.Background(), &metadata)
+	destination := metadata.Destination
+	picked := s.Pick(ctx, N.NetworkICMP, destination)
+	if picked == nil {
+		return nil, E.New("no outbound available for network: ", metadata.Network)
+	}
+	if !common.Contains(picked.Network(), metadata.Network) {
+		return nil, E.New(metadata.Network, " is not supported by outbound: ", picked.Tag())
+	}
+	dro, ok := picked.(adapter.DirectRouteOutbound)
+	if !ok {
+		return nil, E.New("outbound does not support direct route: ", picked.Tag())
+	}
+	return dro.NewDirectRouteConnection(metadata, routeContext, timeout)
+}
+
 // Close implements adapter.Service
 func (s *LoadBalance) Close() error {
 	if s.Balancer == nil {
@@ -161,7 +216,8 @@ func (s *LoadBalance) Start() error {
 	if err := s.InitProviders(s.outbound, s.provider); err != nil {
 		return err
 	}
-	b, err := balancer.New(s.ctx, s.router, s.outbound, s.Providers(), &s.options, s.logger)
+	hc := healthcheck.New(s.ctx, s.router, s.outbound, s.Providers(), &s.options.Check, s.logger)
+	b, err := balancer.New(s.logger, &s.GroupAdapter, hc, s.options.Pick)
 	if err != nil {
 		return err
 	}

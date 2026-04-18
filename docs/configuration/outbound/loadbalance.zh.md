@@ -9,6 +9,7 @@
     "proxy-b",
     "proxy-c"
   ],
+  "all_providers": false,
   "providers": [
     "provider-a",
     "provider-b",
@@ -38,8 +39,24 @@
       "200ms",
       "250ms",
       "350ms"
+    ],
+    "biases": [
+      {
+        "contains": "keyword",
+        "prefix": "",
+        "suffix": "",
+        "regexp": "",
+        "rtt_scale": 10
+      }
     ]
-  }
+  },
+  "profiles": [
+    {
+      "tag": "loadbalance-alive",
+      "objective": "alive",
+      "strategy": "random"
+    }
+  ]
 }
 ```
 
@@ -48,6 +65,10 @@
 #### outbounds
 
 出站标签列表。
+
+#### all_providers
+
+当 `all_providers` 为 `true` 时，将使用所有订阅，而不只是 `providers` 列表中的订阅。默认为 `false`。
 
 #### providers
 
@@ -181,3 +202,24 @@ Shadowsocks (A) ---> Trojan [B.Node]
 
 1. `expected:3, baselines =["30ms","50ms","100ms"]`，依次尝试不同基准线，直到找到至少3个节点。否则返回标准差最小的3个。这种配置的好处是，既找到合适数量的节点，又不浪费素质相近的更多节点。
 1. `baselines: ["30ms","50ms","100ms"]`，依次尝试不同基准线，若没有符合任何基准线的节点，返回标准差最小的一个。
+
+#### biases
+
+负载均衡的挑选偏好。默认为空。
+
+当节点标签匹配 `biases` 中的条件时，挑选时会将该节点的往返时间(或标准差)乘以 `rtt_scale` 进行比较。
+`rtt_scale` 默认为 `1`，越大表示越不偏好该节点。
+举例来说，`rtt_scale: 10` 表示当节点的往返时间为 `100ms` 时，比较时将其视为 `1000ms`。
+
+- `contains` 表示节点标签包含某个关键词时匹配。
+- `prefix` 表示节点标签以某个关键词开头时匹配。
+- `suffix` 表示节点标签以某个关键词结尾时匹配。
+- `regexp` 表示节点标签匹配某个正则表达式时匹配。
+
+如果配置了多个条件，满足任一条件即可匹配。
+
+### profiles
+
+负载均衡的额外配置文件，默认为空。当 `profiles` 不为空时，sing-box 将为每个配置文件创建一个出站，标签为配置中的 `tag` 字段，其余字段参考[节点挑选字段](#节点挑选字段)。
+
+新增出站基于当前负载均衡出站，不会增加额外的健康检查开销。

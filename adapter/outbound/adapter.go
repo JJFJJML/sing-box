@@ -49,11 +49,15 @@ func (a *Adapter) Dependencies() []string {
 
 func NewGroupAdapter(
 	outboundType string, outboundTag string, network []string,
-	router adapter.Router, options option.ProviderGroupCommonOption,
+	options option.ProviderGroupCommonOption,
+	extraDeps ...string,
 ) GroupAdapter {
+	deps := options.Outbounds
+	if len(extraDeps) > 0 {
+		deps = append(deps, extraDeps...)
+	}
 	adapter := GroupAdapter{
-		Adapter: NewAdapter(outboundType, outboundTag, network, options.Outbounds),
-		router:  router,
+		Adapter: NewAdapter(outboundType, outboundTag, network, deps),
 		options: options,
 	}
 	return adapter
@@ -62,7 +66,6 @@ func NewGroupAdapter(
 type GroupAdapter struct {
 	Adapter
 
-	router         adapter.Router
 	options        option.ProviderGroupCommonOption
 	providers      []adapter.Provider
 	providersByTag map[string]adapter.Provider
@@ -79,7 +82,7 @@ func (a *GroupAdapter) All() []string {
 }
 
 func (a *GroupAdapter) InitProviders(om adapter.OutboundManager, pm adapter.ProviderManager) error {
-	if len(a.options.Outbounds)+len(a.options.Providers) == 0 {
+	if len(a.options.Outbounds)+len(a.options.Providers) == 0 && !a.options.AllProviders {
 		return E.New("missing outbound and provider tags")
 	}
 	outbounds := make([]adapter.Outbound, 0, len(a.options.Outbounds))
@@ -95,11 +98,20 @@ func (a *GroupAdapter) InitProviders(om adapter.OutboundManager, pm adapter.Prov
 	if len(outbounds) > 0 {
 		providers = append(providers, provider.NewMemory(outbounds))
 	}
+	if a.options.AllProviders {
+		for _, p := range pm.Providers() {
+			providers = append(providers, p)
+			providersByTag[p.Tag()] = p
+		}
+	}
 	var err error
 	for _, tag := range a.options.Providers {
 		p, ok := pm.Provider(tag)
 		if !ok {
 			return E.New("provider not found: ", tag)
+		}
+		if _, exists := providersByTag[tag]; exists {
+			continue
 		}
 		if a.options.Exclude != "" || a.options.Include != "" {
 			p, err = provider.NewFiltered(p, a.options.Exclude, a.options.Include)

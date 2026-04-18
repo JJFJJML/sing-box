@@ -9,6 +9,7 @@
     "proxy-b",
     "proxy-c"
   ],
+  "all_providers": false,
   "providers": [
     "provider-a",
     "provider-b",
@@ -38,8 +39,24 @@
       "200ms",
       "250ms",
       "350ms"
+    ],
+    "biases": [
+      {
+        "contains": "keyword",
+        "prefix": "",
+        "suffix": "",
+        "regexp": "",
+        "rtt_scale": 10
+      }
     ]
-  }
+  },
+  "profiles": [
+    {
+      "tag": "loadbalance-alive",
+      "objective": "alive",
+      "strategy": "random"
+    }
+  ]
 }
 ```
 
@@ -48,6 +65,10 @@
 #### outbounds
 
 List of outbound tags.
+
+#### all_providers
+
+When `all_providers` is `true`, all providers will be used instead of just those in the `providers` list. The default value is `false`.
 
 #### providers
 
@@ -181,3 +202,25 @@ Here are typical configuration for `leastload`:
 1. `expected:3, baselines =["30ms","50ms","100ms"]`, try different baselines until we find at least 3 nodes. Otherwise select the top 3 nodes with the smallest STD. The advantage is that it can find a proper quantity of nodes without wasting nodes with similar qualities.
 
 1. `baselines: ["30ms","50ms","100ms"]`, try to select nodes by different baselines. If there is no node matching any baseline, return the one with the smallest STD.
+
+#### biases
+
+The picking bias of load balancing. Default is empty.
+
+When the node tag matches the condition in `biases`,
+its round-trip time (or standard deviation) will be multiplied by `rtt_scale` for comparison when picking.
+The default value of `rtt_scale` is `1`, and the larger it is, the less preferred the node is. 
+For example, `rtt_scale: 10` means that when the node's round-trip time is `100ms`, it will be treated as `1000ms` for comparison.
+
+- `contains` means matching when the node tag contains a keyword.
+- `prefix` means matching when the node tag starts with a keyword.
+- `suffix` means matching when the node tag ends with a keyword.
+- `regexp` means matching when the node tag matches a regular expression.
+
+If multiple conditions are configured, matching any one of them is sufficient.
+
+### profiles
+
+The extra profile for load balancing, default is empty. When `profiles` is not empty, sing-box will create an outbound for each profile, with the `tag` field in profile as the tag of the outbound, and the rest of the fields refer to [Pick Fields](#pick-fields) .
+
+The new outbound is based on the current load balancing outbound, and does not add extra health check overhead.

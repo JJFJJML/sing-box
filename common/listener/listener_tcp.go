@@ -17,7 +17,7 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
 
-	"github.com/metacubex/tfo-go"
+	"github.com/database64128/tfo-go/v2"
 )
 
 func (l *Listener) ListenTCP() (net.Listener, error) {
@@ -26,7 +26,7 @@ func (l *Listener) ListenTCP() (net.Listener, error) {
 		return nil, E.New("Proxy Protocol is deprecated and removed in sing-box 1.6.0")
 	}
 	var err error
-	bindAddr := M.SocksaddrFrom(l.listenOptions.Listen.Build(netip.AddrFrom4([4]byte{127, 0, 0, 1})), l.listenOptions.ListenPort)
+	bindAddr := M.SocksaddrFrom(l.listenOptions.Listen.Build(netip.AddrFrom4([4]byte{127, 0, 0, 1})), l.listenOptions.ListenPort.Build())
 	var listenConfig net.ListenConfig
 	if l.listenOptions.BindInterface != "" {
 		listenConfig.Control = control.Append(listenConfig.Control, control.BindToInterface(service.FromContext[adapter.NetworkManager](l.ctx).InterfaceFinder(), l.listenOptions.BindInterface, -1))
@@ -37,7 +37,10 @@ func (l *Listener) ListenTCP() (net.Listener, error) {
 	if l.listenOptions.ReuseAddr {
 		listenConfig.Control = control.Append(listenConfig.Control, control.ReuseAddr())
 	}
-	if l.listenOptions.TCPKeepAlive >= 0 {
+	if l.listenOptions.DisableTCPKeepAlive {
+		listenConfig.KeepAlive = -1
+		listenConfig.KeepAliveConfig.Enable = false
+	} else {
 		keepIdle := time.Duration(l.listenOptions.TCPKeepAlive)
 		if keepIdle == 0 {
 			keepIdle = C.TCPKeepAliveInitial
@@ -46,13 +49,14 @@ func (l *Listener) ListenTCP() (net.Listener, error) {
 		if keepInterval == 0 {
 			keepInterval = C.TCPKeepAliveInterval
 		}
-		setKeepAliveConfig(&listenConfig, keepIdle, keepInterval)
+		listenConfig.KeepAliveConfig = net.KeepAliveConfig{
+			Enable:   true,
+			Idle:     keepIdle,
+			Interval: keepInterval,
+		}
 	}
 	if l.listenOptions.TCPMultiPath {
-		if !go121Available {
-			return nil, E.New("MultiPath TCP requires go1.21, please recompile your binary.")
-		}
-		setMultiPathTCP(&listenConfig)
+		listenConfig.SetMultipathTCP(true)
 	}
 	if l.tproxy {
 		listenConfig.Control = control.Append(listenConfig.Control, func(network, address string, conn syscall.RawConn) error {
@@ -98,8 +102,6 @@ func (l *Listener) loopTCPIn() {
 		}
 		//nolint:staticcheck
 		metadata.InboundDetour = l.listenOptions.Detour
-		//nolint:staticcheck
-		metadata.InboundOptions = l.listenOptions.InboundOptions
 		metadata.Source = M.SocksaddrFromNet(conn.RemoteAddr()).Unwrap()
 		metadata.OriginDestination = M.SocksaddrFromNet(conn.LocalAddr()).Unwrap()
 		ctx := log.ContextWithNewID(l.ctx)

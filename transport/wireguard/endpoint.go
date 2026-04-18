@@ -8,8 +8,16 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"reflect"
 	"strings"
+	"sync"
+	"time"
+	"unsafe"
 
+	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/dialer"
+	C "github.com/sagernet/sing-box/constant"
+	tun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
@@ -29,9 +37,15 @@ type Endpoint struct {
 	ipcConf        string
 	allowedAddress []netip.Prefix
 	tunDevice      Device
+	natDevice      NatDevice
 	device         *device.Device
+	allowedIPs     *device.AllowedIPs
 	pause          pause.Manager
 	pauseCallback  *list.Element[pause.Callback]
+
+	startedWithFQDN bool
+	mu              sync.Mutex
+	lastDNSCheck    time.Time
 }
 
 func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
@@ -55,7 +69,7 @@ func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
 		}
 		if rawPeer.Endpoint.Addr.IsValid() {
 			peer.endpoint = rawPeer.Endpoint.AddrPort()
-		} else if rawPeer.Endpoint.IsFqdn() {
+		} else if rawPeer.Endpoint.IsDomain() {
 			peer.destination = rawPeer.Endpoint
 		}
 		publicKeyBytes, err := base64.StdEncoding.DecodeString(rawPeer.PublicKey)
@@ -111,24 +125,30 @@ func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
 	if err != nil {
 		return nil, E.Cause(err, "create WireGuard device")
 	}
+	natDevice, isNatDevice := tunDevice.(NatDevice)
+	if !isNatDevice {
+		natDevice = NewNATDevice(options.Context, options.Logger, tunDevice)
+	}
 	return &Endpoint{
 		options:        options,
 		peers:          peers,
 		ipcConf:        ipcConf,
 		allowedAddress: allowedAddresses,
 		tunDevice:      tunDevice,
+		natDevice:      natDevice,
 	}, nil
 }
 
 func (e *Endpoint) Start(resolve bool) error {
-	if common.Any(e.peers, func(peer peerConfig) bool {
-		return !peer.endpoint.IsValid() && peer.destination.IsFqdn()
-	}) {
+	withDomain := common.Any(e.peers, func(peer peerConfig) bool {
+		return !peer.endpoint.IsValid() && peer.destination.IsDomain()
+	})
+	if withDomain {
 		if !resolve {
 			return nil
 		}
 		for peerIndex, peer := range e.peers {
-			if peer.endpoint.IsValid() || !peer.destination.IsFqdn() {
+			if peer.endpoint.IsValid() || !peer.destination.IsDomain() {
 				continue
 			}
 			destinationAddress, err := e.options.ResolvePeer(peer.destination.Fqdn)
@@ -141,9 +161,9 @@ func (e *Endpoint) Start(resolve bool) error {
 		return nil
 	}
 	var bind conn.Bind
-	wgListener, isWgListener := common.Cast[conn.Listener](e.options.Dialer)
+	wgListener, isWgListener := common.Cast[dialer.WireGuardListener](e.options.Dialer)
 	if isWgListener {
-		bind = conn.NewStdNetBind(wgListener)
+		bind = conn.NewStdNetBind(wgListener.WireGuardControl())
 	} else {
 		var (
 			isConnect   bool
@@ -176,7 +196,13 @@ func (e *Endpoint) Start(resolve bool) error {
 			e.options.Logger.Error(fmt.Sprintf(strings.ToLower(format), args...))
 		},
 	}
-	wgDevice := device.NewDevice(e.options.Context, e.tunDevice, bind, logger, e.options.Workers)
+	var deviceInput Device
+	if e.natDevice != nil {
+		deviceInput = e.natDevice
+	} else {
+		deviceInput = e.tunDevice
+	}
+	wgDevice := device.NewDevice(e.options.Context, deviceInput, bind, logger, e.options.Workers)
 	e.tunDevice.SetDevice(wgDevice)
 	ipcConf := e.ipcConf
 	for _, peer := range e.peers {
@@ -191,6 +217,8 @@ func (e *Endpoint) Start(resolve bool) error {
 	if e.pause != nil {
 		e.pauseCallback = e.pause.RegisterCallback(e.onPauseUpdated)
 	}
+	e.allowedIPs = (*device.AllowedIPs)(unsafe.Pointer(reflect.Indirect(reflect.ValueOf(wgDevice)).FieldByName("allowedips").UnsafeAddr()))
+	e.startedWithFQDN = withDomain
 	return nil
 }
 
@@ -198,24 +226,54 @@ func (e *Endpoint) DialContext(ctx context.Context, network string, destination 
 	if !destination.Addr.IsValid() {
 		return nil, E.Cause(os.ErrInvalid, "invalid non-IP destination")
 	}
-	return e.tunDevice.DialContext(ctx, network, destination)
+	conn, err := e.tunDevice.DialContext(ctx, network, destination)
+	if err != nil {
+		e.checkUpdateDNSIfNeeded()
+		return nil, err
+	}
+	return conn, nil
 }
 
 func (e *Endpoint) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	if !destination.Addr.IsValid() {
 		return nil, E.Cause(os.ErrInvalid, "invalid non-IP destination")
 	}
-	return e.tunDevice.ListenPacket(ctx, destination)
+	conn, err := e.tunDevice.ListenPacket(ctx, destination)
+	if err != nil {
+		e.checkUpdateDNSIfNeeded()
+		return nil, err
+	}
+	return conn, nil
 }
 
 func (e *Endpoint) Close() error {
-	if e.device != nil {
-		e.device.Close()
-	}
 	if e.pauseCallback != nil {
 		e.pause.UnregisterCallback(e.pauseCallback)
 	}
+	if e.device != nil {
+		e.device.Down()
+		e.device.Close()
+	}
 	return nil
+}
+
+func (e *Endpoint) Lookup(address netip.Addr) *device.Peer {
+	if e.allowedIPs == nil {
+		return nil
+	}
+	return e.allowedIPs.Lookup(address.AsSlice())
+}
+
+func (e *Endpoint) NewDirectRouteConnection(metadata adapter.InboundContext, routeContext tun.DirectRouteContext, timeout time.Duration) (tun.DirectRouteDestination, error) {
+	if e.natDevice == nil {
+		return nil, os.ErrInvalid
+	}
+	dst, err := e.natDevice.CreateDestination(metadata, routeContext, timeout)
+	if err != nil {
+		e.checkUpdateDNSIfNeeded()
+		return nil, err
+	}
+	return dst, nil
 }
 
 func (e *Endpoint) onPauseUpdated(event int) {
@@ -252,4 +310,47 @@ func (c peerConfig) GenerateIpcLines() string {
 		ipcLines += "\npersistent_keepalive_interval=" + F.ToString(c.keepalive)
 	}
 	return ipcLines
+}
+
+func (e *Endpoint) checkUpdateDNSIfNeeded() {
+	if e.startedWithFQDN {
+		go e.checkUpdateDNS()
+	}
+}
+
+func (e *Endpoint) checkUpdateDNS() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if time.Since(e.lastDNSCheck) < C.DNSTimeout {
+		return
+	}
+	defer func() {
+		e.lastDNSCheck = time.Now()
+	}()
+	changed := false
+	for i, peer := range e.peers {
+		if !peer.destination.IsFqdn() {
+			continue
+		}
+		newAddr, err := e.options.ResolvePeer(peer.destination.Fqdn)
+		if err != nil {
+			e.options.Logger.Warn(E.Cause(err, "failed to resolve ", peer.destination.Fqdn))
+			continue
+		}
+		newEndpoint := netip.AddrPortFrom(newAddr, peer.destination.Port)
+		if newEndpoint != peer.endpoint {
+			e.peers[i].endpoint = newEndpoint
+			changed = true
+		}
+	}
+	if changed {
+		ipcConf := e.ipcConf
+		for _, peer := range e.peers {
+			ipcConf += peer.GenerateIpcLines()
+		}
+		err := e.device.IpcSet(ipcConf)
+		if err != nil {
+			e.options.Logger.Error(E.Cause(err, "failed to update WireGuard config"))
+		}
+	}
 }

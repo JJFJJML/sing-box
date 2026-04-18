@@ -10,6 +10,7 @@
     "proxy-b",
     "proxy-c"
   ],
+  "all_providers": false,
   "providers": [
     "provider-a",
     "provider-b",
@@ -23,13 +24,17 @@
 
 !!! quote ""
 
-    选择器目前只能通过 [Clash API](/zh/configuration/experimental#clash-api) 来控制。
+    选择器目前只能通过 [Clash API](/zh/configuration/experimental/clash-api/) 来控制。
 
 ### 字段
 
 #### outbounds
 
 用于选择的出站标签列表。
+
+#### all_providers
+
+当 `all_providers` 为 `true` 时，将使用所有订阅，而不只是 `providers` 列表中的订阅。默认为 `false`。
 
 #### providers
 

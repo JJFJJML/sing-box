@@ -18,10 +18,8 @@ var (
 	benchmarkPickOptions = option.LoadBalancePickOptions{
 		Expected: 9999,
 	}
-	benchmarkAliveObjective     = balancer.NewAliveObjective()
-	benchmarkLeastLoadObjective = balancer.NewLeastObjective(10, benchmarkPickOptions, func(node *balancer.Node) healthcheck.RTT {
-		return node.Deviation
-	})
+	benchmarkAliveObjective         = balancer.NewAliveObjective()
+	benchmarkLeastLoadObjective     = balancer.NewLeastLoadObjective(benchmarkPickOptions)
 	benchmarkRandomStrategy         = balancer.NewRandomStrategy()
 	benchmarkRoundRobinStrategy     = balancer.NewRoundRobinStrategy()
 	benchmarkConsistentHashStrategy = balancer.NewConsistentHashStrategy()
@@ -110,13 +108,7 @@ func benchmarkGetAllNodes(b *testing.B, count int) {
 func allNodes(outbounds []adapter.Outbound, s *healthcheck.Storages) []*balancer.Node {
 	all := make([]*balancer.Node, 0, len(outbounds))
 	for i, o := range outbounds {
-		stat := s.Stats(o.Tag())
-		node := &balancer.Node{
-			Index:    i,
-			Outbound: o,
-			Stats:    stat,
-		}
-		node.CalcStatus(healthcheck.Second, 0)
+		node := balancer.NewNode(o, i, 1, s.Stats(o.Tag()), balancer.StatusUnknown)
 		all = append(all, node)
 	}
 	return all
